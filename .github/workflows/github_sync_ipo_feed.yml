@@ -1,0 +1,66 @@
+name: Sync IPO India Hub Live Feed
+
+on:
+  workflow_dispatch:
+  schedule:
+    # Every 30 minutes 08:30-23:00 IST (03:00-17:30 UTC), Monday to Saturday
+    - cron: '0,30 3-17 * * 1-6'
+    # Twice on Sunday for Monday upcoming IPO / GMP updates (12:00 & 21:00 IST)
+    - cron: '30 6,15 * * 0'
+
+permissions:
+  contents: read
+
+jobs:
+  export-and-upload:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python 3.12
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      - name: Generate live ipo_feed.json
+        run: |
+          if [ -f "scripts/export_ipo_feed.py" ]; then
+            python scripts/export_ipo_feed.py --out ipo_feed.json
+          else
+            python export_ipo_feed.py --out ipo_feed.json
+          fi
+          python -c "import json; d=json.load(open('ipo_feed.json', encoding='utf-8')); assert 'catalog' in d and isinstance(d['catalog'], list), 'Invalid feed'; print('Validated catalog entries:', len(d['catalog']))"
+
+      - name: Upload ipo_feed.json to Supabase Storage
+        env:
+          SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
+          SUPABASE_SERVICE_KEY: ${{ secrets.SUPABASE_SERVICE_KEY }}
+        run: |
+          BASE_URL="${SUPABASE_URL%/}"
+          if [ -z "$BASE_URL" ] || [ -z "$SUPABASE_SERVICE_KEY" ]; then
+            echo "Missing SUPABASE_URL or SUPABASE_SERVICE_KEY secret."
+            exit 1
+          fi
+
+          # Support both new sb_secret_* keys (apikey header only) and legacy service_role JWTs (apikey + Authorization: Bearer)
+          if [[ "$SUPABASE_SERVICE_KEY" == eyJ* ]]; then
+            curl --fail-with-body -sS -X POST \
+              "$BASE_URL/storage/v1/object/ipo-feed/ipo_feed.json" \
+              -H "apikey: $SUPABASE_SERVICE_KEY" \
+              -H "Authorization: Bearer $SUPABASE_SERVICE_KEY" \
+              -H "x-upsert: true" \
+              -H "cache-control: max-age=60" \
+              -H "Content-Type: application/json" \
+              --data-binary "@ipo_feed.json"
+          else
+            curl --fail-with-body -sS -X POST \
+              "$BASE_URL/storage/v1/object/ipo-feed/ipo_feed.json" \
+              -H "apikey: $SUPABASE_SERVICE_KEY" \
+              -H "x-upsert: true" \
+              -H "cache-control: max-age=60" \
+              -H "Content-Type: application/json" \
+              --data-binary "@ipo_feed.json"
+          fi
+          echo ""
+          echo "Uploaded ipo_feed.json to $BASE_URL/storage/v1/object/public/ipo-feed/ipo_feed.json"
