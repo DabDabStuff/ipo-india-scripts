@@ -64,3 +64,11 @@ jobs:
           fi
           echo ""
           echo "Uploaded ipo_feed.json to $BASE_URL/storage/v1/object/public/ipo-feed/ipo_feed.json"
+
+      - name: Save ipo_feed.json as downloadable backup artifact
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: ipo-feed-json
+          path: ipo_feed.json
+          retention-days: 3
