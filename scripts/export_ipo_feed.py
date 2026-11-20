@@ -300,6 +300,9 @@ def extract_ipowatch_subscriptions(detail: Dict[str, Any]) -> Dict[str, Optional
         elif isinstance(val, dict):
             candidates.append(val)
 
+    # Sort candidates chronologically by subscriptionDate so the latest day's reading wins
+    candidates.sort(key=lambda r: str(r.get("subscriptionDate") or ""))
+
     for row in candidates:
         cat = str(
             row.get("category")
@@ -309,18 +312,25 @@ def extract_ipowatch_subscriptions(detail: Dict[str, Any]) -> Dict[str, Optional
             or ""
         ).lower()
         sub_val = (
-            to_float(row.get("times"))
-            or to_float(row.get("subscription"))
-            or to_float(row.get("subscriptionTimes"))
-            or to_float(row.get("subTimes"))
+            to_float(row.get("subscriptionValue"))
+            if to_float(row.get("subscriptionValue")) is not None
+            else (
+                to_float(row.get("times"))
+                if to_float(row.get("times")) is not None
+                else (
+                    to_float(row.get("subscription"))
+                    if to_float(row.get("subscription")) is not None
+                    else (to_float(row.get("subscriptionTimes")) or to_float(row.get("subTimes")))
+                )
+            )
         )
         if sub_val is None:
             continue
         if "qib" in cat:
             out["qib"] = sub_val
-        elif "bhni" in cat or "bnii" in cat or "above" in cat:
+        elif "bhni" in cat or "bnii" in cat or "above" in cat or "> ?10" in cat or "> ₹10" in cat:
             out["bhni"] = sub_val
-        elif "shni" in cat or "snii" in cat or "below" in cat:
+        elif "shni" in cat or "snii" in cat or "below" in cat or "< ?10" in cat or "< ₹10" in cat:
             out["shni"] = sub_val
         elif "nii" in cat or "hni" in cat:
             out["niiTotal"] = sub_val
@@ -475,10 +485,29 @@ def resolve_segment_and_exchange(detail: Dict[str, Any]) -> Tuple[str, str]:
     return "MAINBOARD", exch_str or "NSE, BSE"
 
 
+IPOWATCH_API_BASES = (
+    "https://ipowatch.in/server/api/ipo",
+    "https://ipowatch.in/api/ipo",
+)
+
+
+def fetch_ipowatch_endpoint(rel_path: str) -> Dict[str, Any]:
+    last_err: Optional[Exception] = None
+    clean_rel = rel_path.lstrip("/")
+    for base in IPOWATCH_API_BASES:
+        try:
+            return fetch_json(f"{base}/{clean_rel}")
+        except Exception as exc:
+            last_err = exc
+    if last_err is not None:
+        raise last_err
+    return {}
+
+
 def build_ipowatch_records(today: dt.date) -> Tuple[List[Dict[str, Any]], List[Dict[str, Any]]]:
-    listings = fetch_json("https://ipowatch.in/api/ipo/GetIpoListing").get("data", [])
-    by_status = fetch_json("https://ipowatch.in/api/ipo/GetIpoListingByStatus").get("data", [])
-    gmp_hist_rows = fetch_json("https://ipowatch.in/api/ipo/GetIpoGMPHistory").get("result", [])
+    listings = fetch_ipowatch_endpoint("GetIpoListing").get("data", [])
+    by_status = fetch_ipowatch_endpoint("GetIpoListingByStatus").get("data", [])
+    gmp_hist_rows = fetch_ipowatch_endpoint("GetIpoGMPHistory").get("result", [])
 
     gmp_label_by_id: Dict[int, str] = {}
     for row in gmp_hist_rows:
@@ -496,7 +525,7 @@ def build_ipowatch_records(today: dt.date) -> Tuple[List[Dict[str, Any]], List[D
 
     for ipo_id, summary in seen_ids.items():
         try:
-            detail_rows = fetch_json(f"https://ipowatch.in/api/ipo/{ipo_id}").get("data") or []
+            detail_rows = fetch_ipowatch_endpoint(str(ipo_id)).get("data") or []
         except Exception as exc:
             print(f"[warn] Failed IPOWatch detail {ipo_id}: {exc}", file=sys.stderr)
             continue
