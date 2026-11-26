@@ -213,11 +213,11 @@ def fetch_json(url: str, opener: Optional[urllib.request.OpenerDirector] = None,
         return json.loads(resp.read().decode("utf-8", errors="replace"))
 
 
-def fetch_text(url: str, timeout: int = 15) -> str:
-    req = urllib.request.Request(
-        url,
-        headers={"User-Agent": USER_AGENT, "Accept": "text/csv,text/plain,*/*"},
-    )
+def fetch_text(url: str, timeout: int = 15, referer: Optional[str] = None) -> str:
+    headers = {"User-Agent": USER_AGENT, "Accept": "text/csv,text/plain,*/*"}
+    if referer:
+        headers["Referer"] = referer
+    req = urllib.request.Request(url, headers=headers)
     with urllib.request.urlopen(req, timeout=timeout) as resp:
         return resp.read().decode("utf-8", errors="replace")
 
@@ -279,6 +279,72 @@ def fetch_latest_bhavcopy(today: dt.date) -> Tuple[Optional[str], Dict[str, Dict
         if quotes:
             return d.isoformat(), quotes
     return None, {}
+
+
+def fetch_bse_bhavcopy_for_date(target_date: dt.date) -> Tuple[Dict[str, Dict[str, Any]], Dict[str, str]]:
+    yyyymmdd = target_date.strftime("%Y%m%d")
+    url = f"https://www.bseindia.com/download/BhavCopy/Equity/BhavCopy_BSE_CM_0_0_0_{yyyymmdd}_F_0000.CSV"
+    try:
+        csv_text = fetch_text(url, timeout=18, referer="https://www.bseindia.com/")
+    except Exception:
+        return {}, {}
+    if "TckrSymb" not in csv_text[:400]:
+        return {}, {}
+
+    quotes: Dict[str, Dict[str, Any]] = {}
+    name_to_sym: Dict[str, str] = {}
+    reader = csv.DictReader(io.StringIO(csv_text))
+    for raw_row in reader:
+        row = {k.strip(): (v or "").strip() for k, v in raw_row.items() if k}
+        sym = row.get("TckrSymb", "").upper()
+        nm = row.get("FinInstrmNm", "")
+        tp = row.get("FinInstrmTp", "").upper()
+        if not sym or (tp and tp not in {"STK", "EQ", ""}):
+            continue
+        close_p = to_float(row.get("ClsPric"))
+        if not close_p or close_p <= 0:
+            continue
+        open_p = to_float(row.get("OpnPric")) or close_p
+        high_p = to_float(row.get("HghPric")) or close_p
+        quotes[sym] = {
+            "series": tp or "BSE",
+            "date": target_date.isoformat(),
+            "open": round(open_p, 2),
+            "high": round(high_p, 2),
+            "close": round(close_p, 2),
+        }
+        nk = norm_match_key(nm)
+        if nk and nk not in name_to_sym:
+            name_to_sym[nk] = sym
+    return quotes, name_to_sym
+
+
+def fetch_latest_bse_bhavcopy(today: dt.date) -> Tuple[Optional[str], Dict[str, Dict[str, Any]], Dict[str, str]]:
+    for offset in range(0, 14):
+        d = today - dt.timedelta(days=offset)
+        quotes, name_map = fetch_bse_bhavcopy_for_date(d)
+        if quotes:
+            return d.isoformat(), quotes, name_map
+    return None, {}, {}
+
+
+def fetch_nse_equity_master() -> Dict[str, str]:
+    """Fetch official NSE EQUITY_L.csv to auto-resolve any new listed IPO symbol by company name."""
+    url = "https://nsearchives.nseindia.com/content/equities/EQUITY_L.csv"
+    try:
+        csv_text = fetch_text(url, timeout=15)
+    except Exception:
+        return {}
+    out: Dict[str, str] = {}
+    reader = csv.DictReader(io.StringIO(csv_text))
+    for raw_row in reader:
+        row = {k.strip(): (v or "").strip() for k, v in raw_row.items() if k}
+        sym = row.get("SYMBOL", "").upper()
+        comp = row.get("NAME OF COMPANY", "")
+        nk = norm_match_key(comp)
+        if sym and nk and nk not in out:
+            out[nk] = sym
+    return out
 
 
 def extract_ipowatch_subscriptions(detail: Dict[str, Any]) -> Dict[str, Optional[float]]:
@@ -732,7 +798,7 @@ def enrich_with_nse_data(
     past_from = (today - dt.timedelta(days=28)).strftime("%d-%m-%Y")
     past_to = today.strftime("%d-%m-%Y")
 
-    nse_symbol_by_norm: Dict[str, str] = {}
+    nse_symbol_by_norm: Dict[str, str] = fetch_nse_equity_master()
     nse_listed_dates_by_sym: Dict[str, str] = {}
 
     try:
@@ -768,11 +834,22 @@ def enrich_with_nse_data(
     except Exception as exc:
         print(f"[warn] NSE ipo-current-issue skipped: {exc}", file=sys.stderr)
 
-    bhav_date, latest_quotes = fetch_latest_bhavcopy(today)
+    bhav_date, nse_latest_quotes = fetch_latest_bhavcopy(today)
+    bse_bhav_date, bse_latest_quotes, bse_sym_by_norm = fetch_latest_bse_bhavcopy(today)
     print(
-        f"[info] NSE Bhavcopy latest date={bhav_date or 'none'} symbols={len(latest_quotes)}",
+        f"[info] NSE Bhavcopy latest date={bhav_date or 'none'} symbols={len(nse_latest_quotes)} | "
+        f"BSE Bhavcopy latest date={bse_bhav_date or 'none'} symbols={len(bse_latest_quotes)}",
         file=sys.stderr,
     )
+
+    # Merge BSE + NSE latest quotes (NSE takes precedence when dual-listed; BSE covers NSE self-listed & BSE SMEs)
+    latest_quotes: Dict[str, Dict[str, Any]] = dict(bse_latest_quotes)
+    latest_quotes.update(nse_latest_quotes)
+    if "NSE" in bse_latest_quotes and "NATIONALST" not in latest_quotes:
+        latest_quotes["NATIONALST"] = dict(bse_latest_quotes["NSE"])
+
+    combined_sym_by_norm: Dict[str, str] = dict(bse_sym_by_norm)
+    combined_sym_by_norm.update(nse_symbol_by_norm)
 
     listing_day_cache: Dict[str, Dict[str, Dict[str, Any]]] = {}
     daily_cache_30d: Dict[str, Dict[str, Dict[str, Any]]] = {}
@@ -785,7 +862,12 @@ def enrich_with_nse_data(
 
     for rec in catalog:
         nk = norm_match_key(rec["companyName"])
-        sym = rec.get("symbol") or nse_symbol_by_norm.get(nk)
+        sym = rec.get("symbol") or combined_sym_by_norm.get(nk)
+        if not sym and len(nk) >= 7:
+            for cand_nk, cand_sym in combined_sym_by_norm.items():
+                if cand_nk.startswith(nk[:7]) or nk.startswith(cand_nk[:7]):
+                    sym = cand_sym
+                    break
         if sym:
             rec["symbol"] = sym
             q = latest_quotes.get(sym)
@@ -794,7 +876,11 @@ def enrich_with_nse_data(
             l_date = rec.get("listingDate") or nse_listed_dates_by_sym.get(sym)
             if l_date and l_date <= today.isoformat() and rec.get("priceUpper", 0) > 0:
                 if l_date not in listing_day_cache:
-                    listing_day_cache[l_date] = daily_cache_30d.get(l_date) or fetch_bhavcopy_for_date(dt.date.fromisoformat(l_date))
+                    nse_ld = daily_cache_30d.get(l_date) or fetch_bhavcopy_for_date(dt.date.fromisoformat(l_date))
+                    bse_ld, _ = fetch_bse_bhavcopy_for_date(dt.date.fromisoformat(l_date))
+                    merged_ld = dict(bse_ld)
+                    merged_ld.update(nse_ld)
+                    listing_day_cache[l_date] = merged_ld
                 lq = listing_day_cache[l_date].get(sym)
                 if lq:
                     rec["listingPrice"] = lq["open"]
@@ -817,7 +903,7 @@ def enrich_with_nse_data(
                 if pts:
                     rec["eodHistory"] = pts
 
-    matched_syms = set(nse_listed_dates_by_sym.keys()) | set(nse_symbol_by_norm.values())
+    matched_syms = set(nse_listed_dates_by_sym.keys()) | set(nse_symbol_by_norm.values()) | {"NSE", "NATIONALST"}
     return latest_quotes, matched_syms, nse_holidays
 
 
@@ -891,7 +977,7 @@ def main() -> int:
     args.out.write_text(json.dumps(payload, indent=2, ensure_ascii=False), encoding="utf-8")
 
     print(
-        f"[ok] Wrote {args.out} ({len(catalog)} active/priced IPOs, {len(drhps)} DRHP watchlist items, {len(eod_by_symbol)} NSE Bhavcopy EOD quotes)"
+        f"[ok] Wrote {args.out} ({len(catalog)} active/priced IPOs, {len(drhps)} DRHP watchlist items, {len(eod_by_symbol)} NSE+BSE Bhavcopy EOD quotes)"
     )
     for item in catalog:
         gmp_str = f"GMP ₹{item['gmpRs']} ({item.get('gmpPct', 0)}%)" if "gmpRs" in item else "GMP N/A"
