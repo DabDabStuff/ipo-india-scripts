@@ -976,8 +976,20 @@ def main() -> int:
     args.out.parent.mkdir(parents=True, exist_ok=True)
     args.out.write_text(json.dumps(payload, indent=2, ensure_ascii=False), encoding="utf-8")
 
+    # Also emit a clean GMP-free companion feed (e.g. ipo_feed_no_gmp.json)
+    no_gmp_catalog = [
+        {k: v for k, v in item.items() if k not in ("gmpRs", "gmpPct", "gmpUpdatedLabel", "gmpHistory")}
+        for item in catalog
+    ]
+    no_gmp_payload = {
+        **payload,
+        "catalog": no_gmp_catalog,
+    }
+    no_gmp_out = args.out.with_name(f"{args.out.stem}_no_gmp{args.out.suffix}")
+    no_gmp_out.write_text(json.dumps(no_gmp_payload, indent=2, ensure_ascii=False), encoding="utf-8")
+
     print(
-        f"[ok] Wrote {args.out} ({len(catalog)} active/priced IPOs, {len(drhps)} DRHP watchlist items, {len(eod_by_symbol)} NSE+BSE Bhavcopy EOD quotes)"
+        f"[ok] Wrote {args.out} and {no_gmp_out} ({len(catalog)} active/priced IPOs, {len(drhps)} DRHP watchlist items, {len(eod_by_symbol)} NSE+BSE Bhavcopy EOD quotes)"
     )
     for item in catalog:
         gmp_str = f"GMP ₹{item['gmpRs']} ({item.get('gmpPct', 0)}%)" if "gmpRs" in item else "GMP N/A"
